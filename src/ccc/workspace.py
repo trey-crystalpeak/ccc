@@ -214,7 +214,7 @@ class Workspace:
         ref = f"refs/ccc/{self.id}"
         _git("fetch", str(self.mnt_project), f"{self.id}:{ref}", repo=self.host_project)
         try:
-            result = _git("diff", f"{self.state.host_branch}...{ref}", repo=self.host_project)
+            result = _git("diff", "--color=always", f"{self.state.host_branch}...{ref}", repo=self.host_project)
             return result.stdout
         finally:
             _git("update-ref", "-d", ref, repo=self.host_project)

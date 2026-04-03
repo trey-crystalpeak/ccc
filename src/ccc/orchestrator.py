@@ -1,5 +1,7 @@
 """Orchestrator — drives the Claude workflow for a workspace."""
 
+import re
+import time
 import traceback
 
 from .autoprompt import run_auto_prompts
@@ -64,16 +66,49 @@ def _log(workspace: Workspace, message: str) -> None:
     print(f"[{label}] {message}")
 
 
+_TRANSIENT_API_ERROR = re.compile(r"API Error: (500|502|503|529)\b")
+_MAX_RETRIES = 5
+_RETRY_DELAYS = [10, 30, 90, 300, 600]
+
+
+def _is_transient_error(output: str) -> bool:
+    """Check if Claude output indicates a transient API error."""
+    return bool(_TRANSIENT_API_ERROR.search(output))
+
+
 def _exec_claude(workspace: Workspace, command: str) -> ClaudeResult:
-    result = workspace.container.exec(command, workdir=WORKDIR)
-    if result.exit_code != 0:
-        detail = result.stderr.strip() or result.stdout.strip()
-        raise RuntimeError(
-            f"Claude exited with code {result.exit_code}: {detail}"
-        )
-    claude_result = ClaudeResult.from_json(result.stdout)
-    workspace.state.total_cost_usd += claude_result.total_cost_usd
-    return claude_result
+    last_error: RuntimeError | None = None
+
+    for attempt in range(_MAX_RETRIES + 1):
+        result = workspace.container.exec(command, workdir=WORKDIR)
+
+        if result.exit_code != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            if _is_transient_error(detail) and attempt < _MAX_RETRIES:
+                delay = _RETRY_DELAYS[attempt]
+                _log(workspace, f"Transient API error, retrying in {delay}s (attempt {attempt + 1}/{_MAX_RETRIES})...")
+                last_error = RuntimeError(
+                    f"Claude exited with code {result.exit_code}: {detail}"
+                )
+                time.sleep(delay)
+                continue
+            raise RuntimeError(
+                f"Claude exited with code {result.exit_code}: {detail}"
+            )
+
+        claude_result = ClaudeResult.from_json(result.stdout)
+
+        if claude_result.is_error and _is_transient_error(claude_result.result) and attempt < _MAX_RETRIES:
+            delay = _RETRY_DELAYS[attempt]
+            _log(workspace, f"Transient API error, retrying in {delay}s (attempt {attempt + 1}/{_MAX_RETRIES})...")
+            time.sleep(delay)
+            continue
+
+        workspace.state.total_cost_usd += claude_result.total_cost_usd
+        return claude_result
+
+    # All retries exhausted — raise the last error or a generic one
+    raise last_error or RuntimeError("Claude failed after retries")
 
 
 MAX_DIFF_LINES = 200
