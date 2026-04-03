@@ -59,10 +59,12 @@ Sent.
 Requires macOS 26 (Tahoe), Apple silicon, Python 3.9+, the [Apple Container CLI](https://developer.apple.com/documentation/apple-containers), and a Claude Code account.
 
 ```
-pip install .
+python3 -m pip install .
 ccc setup          # builds container image, configures git, logs into Claude
 ccc daemon start   # runs in foreground — background it however you like
 ```
+
+After installing, restart your shell (or run `hash -r` in bash/zsh) so it picks up the new `ccc` command. To uninstall: `python3 -m pip uninstall ccc`.
 
 `ccc setup` builds the base container image, prompts for your git author name and email, then opens an interactive Claude Code session for `/login`. Credentials are stored in `~/.ccc/config/`.
 
