@@ -3,27 +3,31 @@
 import json
 import shlex
 from dataclasses import dataclass, field
+from typing import Optional
 
-
-REVIEWER_SCHEMA = json.dumps({
-    "type": "object",
-    "properties": {
-        "status": {
-            "type": "string",
-            "enum": ["work_done", "answer", "needs_input", "not_complete"],
+REVIEWER_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["work_done", "answer", "needs_input", "not_complete"],
+            },
+            "comment": {"type": "string"},
         },
-        "comment": {"type": "string"},
-    },
-    "required": ["status", "comment"],
-})
+        "required": ["status", "comment"],
+    }
+)
 
-CONDITION_SCHEMA = json.dumps({
-    "type": "object",
-    "properties": {
-        "result": {"type": "boolean"},
-    },
-    "required": ["result"],
-})
+CONDITION_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "properties": {
+            "result": {"type": "boolean"},
+        },
+        "required": ["result"],
+    }
+)
 
 
 @dataclass
@@ -47,30 +51,27 @@ class ClaudeResult:
         return cls(**{k: v for k, v in data.items() if k in known})
 
 
-def _command(prompt: str, *args: str) -> str:
-    return " ".join([
-        "claude",
-        "-p", shlex.quote(prompt),
-        *args,
-        "--dangerously-skip-permissions",
-        "--output-format", "json",
-    ])
-
-
 class Agent:
-
-    def __init__(self, name: str, *, model: str, schema: str = "",
-                 max_turns: int = 0, persist_session: bool = False,
-                 state=None) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        model: str,
+        schema: str = "",
+        max_turns: int = 0,
+        persist_session: bool = False,
+        tools: Optional[str] = None,
+        state=None,
+    ) -> None:
         self.name = name
         self.model = model
         self.schema = schema
         self.max_turns = max_turns
         self.persist_session = persist_session
+        self.tools = tools
         self.state = state
 
-    def command(self, prompt: str, *, fork: bool = False,
-                system_prompt: str = "") -> str:
+    def command(self, prompt: str, *, fork: bool = False, system_prompt: str = "") -> str:
         """Build a shell command string. Session ID is pulled from state."""
         args = []
 
@@ -92,7 +93,14 @@ class Agent:
             args.extend(["--json-schema", shlex.quote(self.schema)])
         if self.max_turns:
             args.extend(["--max-turns", str(self.max_turns)])
+        if self.tools is not None:
+            args.extend(["--allowedTools", shlex.quote(self.tools)])
         if not self.persist_session:
             args.append("--no-session-persistence")
 
-        return _command(prompt, *args)
+        return " ".join([
+            "claude", "-p", shlex.quote(prompt),
+            *args,
+            "--dangerously-skip-permissions",
+            "--output-format", "json",
+        ])

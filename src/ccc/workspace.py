@@ -8,14 +8,14 @@ import tempfile
 import threading
 import time
 import uuid
+from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
-from .claude import Agent, REVIEWER_SCHEMA, CONDITION_SCHEMA
+from .claude import CONDITION_SCHEMA, REVIEWER_SCHEMA, Agent
 from .config import load_project
-from .container import Container, build_image, force_remove, image_exists, is_running
-from .state import Event, Status, WorkspaceState, Task, RECOVERABLE_STATES
-
+from .container import Container, Volume, build_image, force_remove, image_exists, is_running
+from .state import RECOVERABLE_STATES, Event, Status, Task, WorkspaceState
 
 BASE_DIR = Path.home() / ".ccc"
 WORKSPACES_DIR = BASE_DIR / "workspaces"
@@ -88,23 +88,55 @@ class Workspace:
         self.mnt_git_config = self.path / "mnt" / "git-config"
         self.state_file = self.path / "state.json"
         self._lock = threading.Lock()
+        self._mounts: list[Volume] = []
 
     def _init_agents(self) -> None:
-        self.agent_namer = Agent("namer", model="haiku", max_turns=1, state=self.state)
+        self.agent_namer = Agent("namer", model="haiku", max_turns=1, tools="", state=self.state)
         self.agent_worker = Agent("worker", model="opus", persist_session=True, state=self.state)
-        self.agent_reviewer = Agent("reviewer", model="sonnet", schema=REVIEWER_SCHEMA, state=self.state)
+        self.agent_reviewer = Agent(
+            "reviewer", model="sonnet", schema=REVIEWER_SCHEMA, state=self.state
+        )
         self.agent_summarizer = Agent("summarizer", model="sonnet", state=self.state)
-        self.agent_evaluator = Agent("evaluator", model="sonnet", schema=CONDITION_SCHEMA, state=self.state)
+        self.agent_evaluator = Agent(
+            "evaluator", model="sonnet", schema=CONDITION_SCHEMA, state=self.state
+        )
 
     @property
-    def volumes(self) -> list[tuple[str, str]]:
+    def volumes(self) -> list[Volume]:
         return [
-            (str(self.mnt_project), WORKDIR),
-            (str(CONFIG_CLAUDE), CLAUDE_CONFIG_MOUNT),
-            (str(self.mnt_git_config), GIT_CONFIG_MOUNT),
+            Volume(str(self.mnt_project), WORKDIR),
+            Volume(str(CONFIG_CLAUDE), CLAUDE_CONFIG_MOUNT),
+            Volume(str(self.mnt_git_config), GIT_CONFIG_MOUNT),
+            *self._mounts,
         ]
 
-    def create(self, prompt: str) -> None:
+    @property
+    def context_paths(self) -> list[str]:
+        return [v.container_path for v in self._mounts]
+
+    def _prepare_mounts(self, paths: list[str]) -> list[Volume]:
+        """Resolve CLI mount paths into readonly volumes.
+
+        Directories are mounted directly at /context/<name>. Files are
+        copied into a shared staging directory mounted at /context/ since
+        Apple Containers only support directory mounts.
+        """
+        staging = self.path / "mnt" / "context"
+        mounts = []
+        for raw in paths:
+            src = Path(raw).expanduser().resolve()
+            if not src.exists():
+                raise ValueError(f"Mount source does not exist: {src}")
+            if src.is_file():
+                staging.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, staging / src.name)
+            else:
+                mounts.append(Volume(str(src), f"/context/{src.name}", readonly=True))
+        if staging.exists():
+            mounts.insert(0, Volume(str(staging), "/context", readonly=True))
+        return mounts
+
+    def create(self, prompt: str, mounts: Optional[list[str]] = None) -> None:
         branch_result = _git("rev-parse", "--abbrev-ref", "HEAD", repo=self.host_project)
         self.state = WorkspaceState(
             workspace_id=self.id,
@@ -119,6 +151,9 @@ class Workspace:
         shutil.copytree(self.host_project, self.mnt_project)
         shutil.copytree(CONFIG_GIT, self.mnt_git_config)
         _git("checkout", "-b", self.id, repo=self.mnt_project)
+
+        self._mounts = self._prepare_mounts(mounts or [])
+        self.state.mounts = [asdict(v) for v in self._mounts]
         self.state.tasks.append(Task(prompt=prompt))
         self.state.save(self.state_file)
 
@@ -142,6 +177,7 @@ class Workspace:
         ws.state = state
         ws.container = Container(ws.id)
         ws._init_agents()
+        ws._mounts = [Volume(**m) for m in state.mounts]
 
         label = state.name or state.workspace_id
         if state.status != Status.ERROR and not is_running(ws.id):
@@ -167,9 +203,16 @@ class Workspace:
         return result.stdout.strip()
 
     def logs(self) -> str:
-        candidates = []
-        candidates.extend(CONFIG_CLAUDE.glob("**/*.jsonl"))
-        candidates.extend(self.mnt_project.glob(".claude/**/*.jsonl"))
+        # Workspace-specific logs are always correct
+        candidates = list(self.mnt_project.glob(".claude/**/*.jsonl"))
+        if not candidates:
+            # Shared config dir has logs from ALL workspaces —
+            # filter by session_id to avoid showing the wrong one.
+            shared = list(CONFIG_CLAUDE.glob("**/*.jsonl"))
+            if self.state.session_id:
+                candidates = [p for p in shared if self.state.session_id in str(p)]
+            if not candidates:
+                candidates = shared
         if not candidates:
             return ""
         latest = max(candidates, key=lambda p: p.stat().st_mtime)
@@ -178,7 +221,8 @@ class Workspace:
     def sync_from_host(self) -> None:
         """Fetch host branch into the workspace as refs/heads/host-main."""
         _git(
-            "fetch", str(self.host_project),
+            "fetch",
+            str(self.host_project),
             f"{self.state.host_branch}:refs/heads/host-main",
             repo=self.mnt_project,
         )
@@ -191,7 +235,10 @@ class Workspace:
                 f"Cannot checkout {self.state.host_branch}: {checkout.stderr.strip()}"
             )
         result = _git(
-            "pull", "--no-rebase", str(self.mnt_project), self.id,
+            "pull",
+            "--no-rebase",
+            str(self.mnt_project),
+            self.id,
             repo=self.host_project,
         )
         if result.returncode != 0:
@@ -202,7 +249,8 @@ class Workspace:
     def merge_from_host(self) -> bool:
         """Merge host into workspace for conflict resolution."""
         _git(
-            "fetch", str(self.host_project),
+            "fetch",
+            str(self.host_project),
             f"{self.state.host_branch}:refs/heads/host-main",
             repo=self.mnt_project,
         )
@@ -214,7 +262,12 @@ class Workspace:
         ref = f"refs/ccc/{self.id}"
         _git("fetch", str(self.mnt_project), f"{self.id}:{ref}", repo=self.host_project)
         try:
-            result = _git("diff", "--color=always", f"{self.state.host_branch}...{ref}", repo=self.host_project)
+            result = _git(
+                "diff",
+                "--color=always",
+                f"{self.state.host_branch}...{ref}",
+                repo=self.host_project,
+            )
             return result.stdout
         finally:
             _git("update-ref", "-d", ref, repo=self.host_project)

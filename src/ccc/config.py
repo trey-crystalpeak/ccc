@@ -3,7 +3,6 @@
 import json
 from pathlib import Path
 
-
 CONFIG_CCC = Path.home() / ".ccc" / "config" / "ccc.json"
 
 
@@ -13,7 +12,8 @@ def load_file(path: Path) -> dict:
         return {}
     try:
         return json.loads(path.read_text())
-    except Exception:
+    except Exception as e:
+        print(f"Warning: failed to load {path}: {e}")
         return {}
 
 

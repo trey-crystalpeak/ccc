@@ -4,9 +4,8 @@ import json
 import shlex
 from pathlib import Path
 
-from .container import ensure_system, build_image, force_remove, Container
-from .workspace import CONFIG_CLAUDE, CONFIG_GIT, IMAGE_NAME, CLAUDE_CONFIG_MOUNT, GIT_CONFIG_MOUNT
-
+from .container import Container, build_image, ensure_system, force_remove
+from .workspace import CLAUDE_CONFIG_MOUNT, CONFIG_CLAUDE, CONFIG_GIT, GIT_CONFIG_MOUNT, IMAGE_NAME
 
 SETUP_CONTAINER = "ccc-setup"
 DOCKERFILE = Path(__file__).resolve().parent.parent.parent / "etc" / "Dockerfile"
@@ -60,14 +59,15 @@ def run_setup(login_only: bool = False, git_only: bool = False) -> None:
     container = Container(SETUP_CONTAINER)
     container.start(IMAGE_NAME, volumes)
 
+    steps = []
+    if not login_only:
+        steps.append(_setup_git)
+    if not git_only:
+        steps.append(_setup_claude)
+
     try:
-        if login_only:
-            _setup_claude(container)
-        elif git_only:
-            _setup_git(container)
-        else:
-            _setup_git(container)
-            _setup_claude(container)
+        for step in steps:
+            step(container)
     finally:
         print("Cleaning up setup container...")
         container.stop()

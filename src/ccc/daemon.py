@@ -6,27 +6,30 @@ import shutil
 import socket
 import subprocess
 import threading
+from dataclasses import asdict
 from typing import Optional
 
 from .container import ensure_system
-from .orchestrator import create_task, resume_task, resolve_conflicts
+from .models import CleanupEntry, StatusDetail, WorkspaceSummary
+from .orchestrator import create_task, resolve_conflicts, resume_task
 from .state import Event, Status, Task
-from .workspace import Workspace, BASE_DIR, WORKSPACES_DIR, SOCKET_PATH
-
+from .workspace import BASE_DIR, SOCKET_PATH, WORKSPACES_DIR, Workspace
 
 NOTIFICATION_MESSAGES = {
     Status.PENDING_HAS_CHANGES: "{name} is done — ready for review",
     Status.PENDING_NEEDS_INPUT: "{name} needs your input",
-    Status.IDLE_ANSWERED:       "{name} answered your question",
-    Status.ERROR:               "{name} hit an error",
+    Status.IDLE_ANSWERED: "{name} answered your question",
+    Status.ERROR: "{name} hit an error",
 }
+
+
+def _osa_quote(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _notify(title: str, message: str) -> None:
     """Send a macOS desktop notification. Best-effort, never raises."""
     try:
-        def _osa_quote(s: str) -> str:
-            return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
         script = f"display notification {_osa_quote(message)} with title {_osa_quote(title)}"
         subprocess.Popen(
             ["osascript", "-e", script],
@@ -38,12 +41,24 @@ def _notify(title: str, message: str) -> None:
 
 
 class Daemon:
-
     def __init__(self) -> None:
         self.workspaces: dict[str, Workspace] = {}
         self.active_threads: set[str] = set()
         self.running = False
         self._caffeinate: Optional[subprocess.Popen] = None
+        self._dispatch_table = {
+            "new": self.handle_new,
+            "list": self.handle_list,
+            "status": self.handle_status,
+            "send": self.handle_send,
+            "merge": self.handle_merge,
+            "delete": self.handle_delete,
+            "diff": self.handle_diff,
+            "logs": self.handle_logs,
+            "cleanup": self.handle_cleanup,
+            "sync": self.handle_sync,
+            "stop": self.handle_stop,
+        }
 
     def _start_caffeinate(self) -> None:
         if self._caffeinate is None:
@@ -88,51 +103,43 @@ class Daemon:
             return None, {"ok": False, "error": "Workspace is busy"}
         return ws, None
 
-    def handle_new(self, path: str, prompt: str) -> dict:
+    def handle_new(self, path: str, prompt: str, mounts: Optional[list[str]] = None) -> dict:
         workspace = Workspace(path)
-        workspace.create(prompt)
+        workspace.create(prompt, mounts=mounts)
         self.workspaces[workspace.id] = workspace
         self._spawn(workspace, create_task, workspace)
         return {"ok": True, "id": workspace.id, "name": workspace.state.name}
 
     def handle_list(self, cwd: Optional[str] = None) -> dict:
-        results = []
+        summaries = []
         for ws in self.workspaces.values():
             if cwd and ws.state.project_path != cwd:
                 continue
-            results.append({
-                "id": ws.id,
-                "name": ws.state.name,
-                "status": ws.state.status.value,
-                "project_path": ws.state.project_path,
-                "total_cost_usd": ws.state.total_cost_usd,
-                "updated_at": ws.state.updated_at,
-            })
-        return {"ok": True, "workspaces": results}
+            summaries.append(
+                WorkspaceSummary(
+                    id=ws.id,
+                    name=ws.state.name,
+                    status=ws.state.status.value,
+                    project_path=ws.state.project_path,
+                    total_cost_usd=ws.state.total_cost_usd,
+                    updated_at=ws.state.updated_at,
+                )
+            )
+        return {"ok": True, "workspaces": [asdict(s) for s in summaries]}
 
     def handle_status(self, id: str) -> dict:
         ws, error = self._get_workspace(id)
         if error:
             return error
-        task_data = None
-        if ws.state.tasks:
-            task = ws.state.current_task
-            task_data = {
-                "prompt": task.prompt,
-                "completed": task.completed,
-                "summary": task.summary,
-                "reviewer_comment": task.reviewer_comment,
-                "messages": task.messages,
-            }
-        return {
-            "ok": True,
-            "id": ws.id,
-            "name": ws.state.name,
-            "status": ws.state.status.value,
-            "total_cost_usd": ws.state.total_cost_usd,
-            "error_message": ws.state.error_message or None,
-            "task": task_data,
-        }
+        detail = StatusDetail(
+            id=ws.id,
+            name=ws.state.name,
+            status=ws.state.status.value,
+            total_cost_usd=ws.state.total_cost_usd,
+            error_message=ws.state.error_message or None,
+            task=ws.state.current_task if ws.state.tasks else None,
+        )
+        return {"ok": True, **asdict(detail)}
 
     def handle_send(self, id: str, message: str) -> dict:
         ws, error = self._get_workspace(id, check_busy=True)
@@ -198,7 +205,7 @@ class Daemon:
                 name = ws.state.name or id
                 ws.delete()
                 del self.workspaces[id]
-                removed.append({"id": id, "name": name})
+                removed.append(CleanupEntry(id=id, name=name))
 
         # Remove orphaned workspace directories not tracked by the daemon
         orphaned = 0
@@ -214,7 +221,7 @@ class Daemon:
                 if project_dir.is_dir() and not any(project_dir.iterdir()):
                     project_dir.rmdir()
 
-        return {"ok": True, "removed": removed, "orphaned": orphaned}
+        return {"ok": True, "removed": [asdict(r) for r in removed], "orphaned": orphaned}
 
     def handle_sync(self, id: str) -> dict:
         ws, error = self._get_workspace(id)
@@ -223,33 +230,17 @@ class Daemon:
         ws.sync_from_host()
         return {"ok": True}
 
+    def handle_stop(self) -> dict:
+        self.running = False
+        return {"ok": True}
+
     def dispatch(self, request: dict) -> dict:
         command = request.get("command")
-        if command == "new":
-            return self.handle_new(request["path"], request["prompt"])
-        elif command == "list":
-            return self.handle_list(request.get("cwd"))
-        elif command == "status":
-            return self.handle_status(request["id"])
-        elif command == "send":
-            return self.handle_send(request["id"], request["message"])
-        elif command == "merge":
-            return self.handle_merge(request["id"])
-        elif command == "delete":
-            return self.handle_delete(request["id"])
-        elif command == "diff":
-            return self.handle_diff(request["id"])
-        elif command == "logs":
-            return self.handle_logs(request["id"])
-        elif command == "cleanup":
-            return self.handle_cleanup()
-        elif command == "sync":
-            return self.handle_sync(request["id"])
-        elif command == "stop":
-            self.running = False
-            return {"ok": True}
-        else:
+        handler = self._dispatch_table.get(command)
+        if handler is None:
             return {"ok": False, "error": f"Unknown command: {command}"}
+        kwargs = {k: v for k, v in request.items() if k != "command"}
+        return handler(**kwargs)
 
     def recover(self) -> None:
         """Scan for existing workspaces and recover what we can."""

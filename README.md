@@ -72,7 +72,7 @@ After installing, restart your shell (or run `hash -r` in bash/zsh) so it picks 
 
 ```
 ccc                            List all workspaces
-ccc new <path> <prompt>        Start a task
+ccc new <path> <prompt> [--context PATH ...]  Start a task
 ccc list [--cwd]               List workspaces (--cwd filters to current directory)
 ccc status <id>                Show state, task, cost, review, and summary
 ccc diff <id>                  Show git diff of workspace changes
@@ -122,6 +122,21 @@ If your project needs additional tooling in the container, add an `image` key to
 ```
 
 Custom images extend `ccc-base` (Ubuntu 24.04 with git and curl). They are tagged by content hash and rebuilt only when the config changes.
+
+## External context
+
+Use `--context` to give the agent readonly access to files or directories outside the project:
+
+```
+ccc new . "Implement the schema" --context ~/design-docs --context ~/schema.sql
+```
+
+Directories are bind-mounted directly. Files are copied into the workspace (Apple Containers only support directory mounts). Inside the container, everything appears under `/context/`:
+
+- `--context ~/design-docs` → `/context/design-docs/`
+- `--context ~/schema.sql` → `/context/schema.sql`
+
+`--context` can be repeated. Mounts are readonly — the agent can read but not modify the originals.
 
 ## Architecture
 

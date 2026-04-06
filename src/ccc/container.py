@@ -13,6 +13,13 @@ class ExecResult:
     exit_code: int
 
 
+@dataclass
+class Volume:
+    host_path: str
+    container_path: str
+    readonly: bool = False
+
+
 def ensure_system() -> None:
     """Start the container service if it is not already running."""
     result = subprocess.run(
@@ -56,7 +63,7 @@ def is_running(name: str) -> bool:
         if isinstance(data, list):
             data = data[0]
         return data.get("state") == "running"
-    except (json.JSONDecodeError, IndexError, KeyError):
+    except (json.JSONDecodeError, IndexError):
         return False
 
 
@@ -66,10 +73,13 @@ class Container:
     def __init__(self, name: str) -> None:
         self.name = name
 
-    def start(self, image: str, volumes: list[tuple[str, str]]) -> None:
+    def start(self, image: str, volumes: list[Volume]) -> None:
         args = ["container", "run", "-d", "--name", self.name]
-        for host_path, container_path in volumes:
-            args.extend(["-v", f"{host_path}:{container_path}"])
+        for vol in volumes:
+            mount = f"{vol.host_path}:{vol.container_path}"
+            if vol.readonly:
+                mount += ":ro"
+            args.extend(["-v", mount])
         args.extend([image, "sleep", "infinity"])
 
         subprocess.run(args, check=True, capture_output=True)

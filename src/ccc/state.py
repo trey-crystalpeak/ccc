@@ -41,6 +41,29 @@ RECOVERABLE_STATES = {
     Status.IDLE_ANSWERED,
 }
 
+# (current_status, event) -> next_status
+TRANSITIONS: dict[tuple[Status, Event], Status] = {
+    (Status.NAMING, Event.NAME_GENERATED): Status.RUNNING,
+    (Status.NAMING, Event.FAILURE): Status.ERROR,
+    (Status.RUNNING, Event.WORKER_EXITED): Status.REVIEWING,
+    (Status.RUNNING, Event.FAILURE): Status.ERROR,
+    (Status.REVIEWING, Event.WORK_DONE): Status.PENDING_HAS_CHANGES,
+    (Status.REVIEWING, Event.ANSWER): Status.IDLE_ANSWERED,
+    (Status.REVIEWING, Event.NEEDS_INPUT): Status.PENDING_NEEDS_INPUT,
+    (Status.REVIEWING, Event.NOT_COMPLETE): Status.RUNNING,
+    (Status.REVIEWING, Event.FAILURE): Status.ERROR,
+    (Status.PENDING_HAS_CHANGES, Event.USER_MESSAGE): Status.RUNNING,
+    (Status.PENDING_HAS_CHANGES, Event.USER_MERGES): Status.MERGING,
+    (Status.PENDING_NEEDS_INPUT, Event.USER_MESSAGE): Status.RUNNING,
+    (Status.PENDING_NEEDS_INPUT, Event.USER_MERGES): Status.MERGING,
+    (Status.MERGING, Event.MERGE_SUCCEEDED): Status.IDLE,
+    (Status.MERGING, Event.MERGE_CONFLICTED): Status.RUNNING,
+    (Status.MERGING, Event.FAILURE): Status.ERROR,
+    (Status.IDLE, Event.USER_MESSAGE): Status.RUNNING,
+    (Status.IDLE_ANSWERED, Event.USER_MESSAGE): Status.RUNNING,
+    (Status.IDLE_ANSWERED, Event.USER_MERGES): Status.MERGING,
+}
+
 
 @dataclass
 class Task:
@@ -60,6 +83,7 @@ class WorkspaceState:
     session_id: str = ""
     host_branch: str = ""
     tasks: list = field(default_factory=list)
+    mounts: list = field(default_factory=list)
     total_cost_usd: float = 0.0
     error_message: str = ""
     created_at: float = field(default_factory=time.time)
@@ -71,67 +95,11 @@ class WorkspaceState:
 
     def handle_event(self, event: Event) -> None:
         """Advance the state machine based on an event."""
-        new_status = None
-
-        if self.status == Status.NAMING:
-            if event == Event.NAME_GENERATED:
-                new_status = Status.RUNNING
-            elif event == Event.FAILURE:
-                new_status = Status.ERROR
-
-        elif self.status == Status.RUNNING:
-            if event == Event.WORKER_EXITED:
-                new_status = Status.REVIEWING
-            elif event == Event.FAILURE:
-                new_status = Status.ERROR
-
-        elif self.status == Status.REVIEWING:
-            if event == Event.WORK_DONE:
-                new_status = Status.PENDING_HAS_CHANGES
-            elif event == Event.ANSWER:
-                new_status = Status.IDLE_ANSWERED
-            elif event == Event.NEEDS_INPUT:
-                new_status = Status.PENDING_NEEDS_INPUT
-            elif event == Event.NOT_COMPLETE:
-                new_status = Status.RUNNING
-            elif event == Event.FAILURE:
-                new_status = Status.ERROR
-
-        elif self.status == Status.PENDING_HAS_CHANGES:
-            if event == Event.USER_MESSAGE:
-                new_status = Status.RUNNING
-            elif event == Event.USER_MERGES:
-                new_status = Status.MERGING
-
-        elif self.status == Status.PENDING_NEEDS_INPUT:
-            if event == Event.USER_MESSAGE:
-                new_status = Status.RUNNING
-            elif event == Event.USER_MERGES:
-                new_status = Status.MERGING
-
-        elif self.status == Status.MERGING:
-            if event == Event.MERGE_SUCCEEDED:
-                new_status = Status.IDLE
-            elif event == Event.MERGE_CONFLICTED:
-                new_status = Status.RUNNING
-            elif event == Event.FAILURE:
-                new_status = Status.ERROR
-
-        elif self.status == Status.IDLE:
-            if event == Event.USER_MESSAGE:
-                new_status = Status.RUNNING
-
-        elif self.status == Status.IDLE_ANSWERED:
-            if event == Event.USER_MESSAGE:
-                new_status = Status.RUNNING
-            elif event == Event.USER_MERGES:
-                new_status = Status.MERGING
-
-        if new_status:
-            self.status = new_status
-        else:
+        new_status = TRANSITIONS.get((self.status, event))
+        if new_status is None:
             print(f"Unexpected event {event} in status {self.status}, moving to ERROR")
-            self.status = Status.ERROR
+            new_status = Status.ERROR
+        self.status = new_status
         self.updated_at = time.time()
 
     def save(self, path: Path) -> None:
